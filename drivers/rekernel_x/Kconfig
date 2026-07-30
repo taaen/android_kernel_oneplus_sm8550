@@ -1,0 +1,4 @@
+config REKERNEL_X
+	tristate "ReKernel-X LKM"
+	depends on KPROBES
+	default m

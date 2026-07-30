@@ -64,3 +64,7 @@ blocklist xc5000
 blocklist limits_stat
 blocklist limits_stress
 blocklist kunit
+# zram/zsmalloc belong to system_dlkm (see modules.load.system_dlkm),
+# exclude from vendor_dlkm to avoid duplicate packaging conflict
+blocklist zram
+blocklist zsmalloc
