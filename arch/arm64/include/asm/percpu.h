@@ -72,7 +72,7 @@ __percpu_##name##_case_##sz(void *ptr, unsigned long val)		\
 									\
 	asm volatile (ARM64_LSE_ATOMIC_INSN(				\
 	/* LSE atomics */						\
-		#op_lse "\t%" #w "[val], %[ptr]\n")			\
+		#op_lse "\t%" #w "[val], %" #w "[tmp], %[ptr]\n")	\
 	: [loop] "=&r" (loop), [tmp] "=&r" (tmp),			\
 	  [ptr] "+Q"(*(u##sz *)ptr)					\
 	: [val] "r" ((u##sz)(val)));					\
@@ -112,9 +112,14 @@ PERCPU_RW_OPS(8)
 PERCPU_RW_OPS(16)
 PERCPU_RW_OPS(32)
 PERCPU_RW_OPS(64)
-PERCPU_OP(add, add, stadd)
-PERCPU_OP(andnot, bic, stclr)
-PERCPU_OP(or, orr, stset)
+
+/*
+ * Use value-returning atomics for CPU-local ops as they are more likely
+ * to execute near the CPU (e.g. in L1 cache).
+ */
+PERCPU_OP(add, add, ldadd)
+PERCPU_OP(andnot, bic, ldclr)
+PERCPU_OP(or, orr, ldset)
 PERCPU_RET_OP(add, add, ldadd)
 
 #undef PERCPU_RW_OPS

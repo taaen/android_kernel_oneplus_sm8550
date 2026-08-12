@@ -2996,6 +2996,16 @@ static inline bool uclamp_is_used(void)
 {
 	return static_branch_likely(&sched_uclamp_used);
 }
+
+/*
+ * Enabling a static branch takes cpus_read_lock(). Since this key is never
+ * disabled after userspace opts in to uclamp, avoid taking that lock again.
+ */
+static inline void sched_uclamp_enable(void)
+{
+	if (!uclamp_is_used())
+		static_branch_enable(&sched_uclamp_used);
+}
 #else /* CONFIG_UCLAMP_TASK */
 static inline unsigned long uclamp_eff_value(struct task_struct *p,
 					     enum uclamp_id clamp_id)
@@ -3022,6 +3032,8 @@ static inline bool uclamp_is_used(void)
 {
 	return false;
 }
+
+static inline void sched_uclamp_enable(void) {}
 
 static inline unsigned long uclamp_rq_get(struct rq *rq,
 					  enum uclamp_id clamp_id)
