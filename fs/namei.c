@@ -317,6 +317,25 @@ static int check_acl(struct user_namespace *mnt_userns,
 	return -EAGAIN;
 }
 
+/*
+ * Very quick optimistic "we know we have no ACL's" check.
+ *
+ * Note that this is purely for ACL_TYPE_ACCESS, and purely
+ * for the "we have cached that there are no ACLs" case.
+ *
+ * If this returns true, we know there are no ACLs. But if
+ * it returns false, we might still not have ACLs (it could
+ * be the is_uncached_acl() case).
+ */
+static inline bool no_acl_inode(struct inode *inode)
+{
+#ifdef CONFIG_FS_POSIX_ACL
+	return likely(!READ_ONCE(inode->i_acl));
+#else
+	return true;
+#endif
+}
+
 /**
  * acl_permission_check - perform basic UNIX permission checking
  * @mnt_userns:	user namespace of the mount the inode was found from
@@ -338,6 +357,28 @@ static int acl_permission_check(struct user_namespace *mnt_userns,
 {
 	unsigned int mode = inode->i_mode;
 	kuid_t i_uid;
+
+	/*
+	 * Common cheap case: everybody has the requested
+	 * rights, and there are no ACLs to check. No need
+	 * to do any owner/group checks in that case.
+	 *
+	 *  - 'mask&7' is the requested permission bit set
+	 *  - multiplying by 0111 spreads them out to all of ugo
+	 *  - '& ~mode' looks for missing inode permission bits
+	 *  - the '!' is for "no missing permissions"
+	 *
+	 * After that, we just need to check that there are no
+	 * ACL's on the inode - do the 'IS_POSIXACL()' check last
+	 * because it will dereference the ->i_sb pointer and we
+	 * want to avoid that if at all possible.
+	 */
+	if (!((mask & 7) * 0111 & ~mode)) {
+		if (no_acl_inode(inode))
+			return 0;
+		if (!IS_POSIXACL(inode))
+			return 0;
+	}
 
 	/* Are we the owner? If so, ACL's don't matter */
 	i_uid = i_uid_into_mnt(mnt_userns, inode);
@@ -534,6 +575,34 @@ int inode_permission(struct user_namespace *mnt_userns,
 	return security_inode_permission(inode, mask);
 }
 EXPORT_SYMBOL(inode_permission);
+
+/*
+ * Check directory traversal rights for may_lookup().
+ *
+ * Path walking only asks for MAY_EXEC, never MAY_WRITE, and the inode is
+ * known to be a directory.  Keep the generic and LSM checks for uncommon
+ * cases, while avoiding their irrelevant branches for the usual 0111,
+ * no-ACL case.
+ */
+static __always_inline int
+lookup_inode_permission_may_exec(struct user_namespace *mnt_userns,
+				 struct inode *inode, int mask)
+{
+	BUILD_BUG_ON_INVALID(!S_ISDIR(inode->i_mode));
+	BUILD_BUG_ON_INVALID(mask & ~MAY_NOT_BLOCK);
+
+	mask |= MAY_EXEC;
+
+	if (unlikely(!(inode->i_opflags &
+		       (IOP_FASTPERM | IOP_FASTPERM_MAY_EXEC))))
+		return inode_permission(mnt_userns, inode, mask);
+
+	if (unlikely((inode->i_mode & 0111) != 0111 ||
+		     !no_acl_inode(inode)))
+		return inode_permission(mnt_userns, inode, mask);
+
+	return security_inode_permission(inode, mask);
+}
 
 /**
  * path_get - get a reference to a path
@@ -1678,9 +1747,9 @@ again:
 	return dentry;
 }
 
-static struct dentry *lookup_slow(const struct qstr *name,
-				  struct dentry *dir,
-				  unsigned int flags)
+static noinline struct dentry *lookup_slow(const struct qstr *name,
+					   struct dentry *dir,
+					   unsigned int flags)
 {
 	struct inode *inode = dir->d_inode;
 	struct dentry *res;
@@ -1691,14 +1760,27 @@ static struct dentry *lookup_slow(const struct qstr *name,
 }
 
 static inline int may_lookup(struct user_namespace *mnt_userns,
-			     struct nameidata *nd)
+			     struct nameidata *__restrict nd)
 {
-	if (nd->flags & LOOKUP_RCU) {
-		int err = inode_permission(mnt_userns, nd->inode, MAY_EXEC|MAY_NOT_BLOCK);
-		if (err != -ECHILD || !try_to_unlazy(nd))
-			return err;
-	}
-	return inode_permission(mnt_userns, nd->inode, MAY_EXEC);
+	int err, mask;
+
+	mask = nd->flags & LOOKUP_RCU ? MAY_NOT_BLOCK : 0;
+	err = lookup_inode_permission_may_exec(mnt_userns, nd->inode, mask);
+	if (likely(!err))
+		return 0;
+
+	/* If we failed outside RCU mode, the result is final. */
+	if (!(nd->flags & LOOKUP_RCU))
+		return err;
+
+	/* Drop out of RCU mode to make sure the failure wasn't transient. */
+	if (!try_to_unlazy(nd))
+		return -ECHILD;
+
+	if (err != -ECHILD)
+		return err;
+
+	return lookup_inode_permission_may_exec(mnt_userns, nd->inode, 0);
 }
 
 static int reserve_stack(struct nameidata *nd, struct path *link, unsigned seq)

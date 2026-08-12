@@ -74,6 +74,7 @@
 #include <linux/perf_event.h>
 #include <linux/ptrace.h>
 #include <linux/vmalloc.h>
+#include <linux/wait.h>
 #include <trace/hooks/mm.h>
 
 #include <trace/events/kmem.h>
@@ -3746,11 +3747,26 @@ static vm_fault_t remove_device_exclusive_entry(struct vm_fault *vmf)
  * We return with the mmap_lock locked or unlocked in the same cases
  * as does filemap_fault().
  */
+static DECLARE_WAIT_QUEUE_HEAD(swapcache_wq);
+
+static void swapcache_wake_waiters(void)
+{
+	/*
+	 * Avoid taking the waitqueue lock when there are no sleepers. A
+	 * missed lockless observation is harmless because every waiter has
+	 * a one-tick timeout.
+	 */
+	if (waitqueue_active(&swapcache_wq))
+		wake_up(&swapcache_wq);
+}
+
 vm_fault_t do_swap_page(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct page *page = NULL, *swapcache;
+	DECLARE_WAITQUEUE(wait, current);
 	struct swap_info_struct *si = NULL;
+	bool need_clear_cache = false;
 	swp_entry_t entry;
 	pte_t pte;
 	int locked;
@@ -3814,9 +3830,27 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 	if (!page) {
 		if (data_race(si->flags & SWP_SYNCHRONOUS_IO) &&
 		    __swap_count(entry) == 1) {
-			/* skip swapcache */
 			gfp_t flags = GFP_HIGHUSER_MOVABLE | __GFP_CMA;
 
+			/*
+			 * Pin the swap entry with SWAP_HAS_CACHE so only one
+			 * thread can use the direct swapin path. Otherwise a
+			 * parallel fault can free and reuse the same entry,
+			 * making pte_same() miss the reuse.
+			 */
+			if (swapcache_prepare(entry)) {
+				add_wait_queue(&swapcache_wq, &wait);
+				schedule_timeout_uninterruptible(1);
+				remove_wait_queue(&swapcache_wq, &wait);
+				delayacct_clear_flag(current,
+						     DELAYACCT_PF_SWAPIN);
+				if (vmf->flags & FAULT_FLAG_SPECULATIVE)
+					ret = VM_FAULT_RETRY;
+				goto out;
+			}
+			need_clear_cache = true;
+
+			/* skip swapcache */
 			trace_android_rvh_set_skip_swapcache_flags(&flags);
 			page = alloc_page_vma(flags, vma, vmf->address);
 			if (page) {
@@ -3995,6 +4029,11 @@ vm_fault_t do_swap_page(struct vm_fault *vmf)
 unlock:
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 out:
+	/* Drop the direct-swapin pin only after releasing the PTE lock. */
+	if (need_clear_cache) {
+		swapcache_clear(si, entry);
+		swapcache_wake_waiters();
+	}
 	if (si)
 		put_swap_device(si);
 	return ret;
@@ -4007,6 +4046,10 @@ out_release:
 	if (page != swapcache && swapcache) {
 		unlock_page(swapcache);
 		put_page(swapcache);
+	}
+	if (need_clear_cache) {
+		swapcache_clear(si, entry);
+		swapcache_wake_waiters();
 	}
 	if (si)
 		put_swap_device(si);

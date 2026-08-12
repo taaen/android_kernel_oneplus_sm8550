@@ -1472,7 +1472,8 @@ retry:
 			goto keep_locked;
 
 		/* page_update_gen() tried to promote this page? */
-		if (lru_gen_enabled() && !ignore_references &&
+		if (lru_gen_enabled() && !lru_gen_switching() &&
+		    !ignore_references &&
 		    page_mapped(page) && PageReferenced(page))
 			goto keep_locked;
 
@@ -2626,7 +2627,7 @@ static void prepare_scan_count(pg_data_t *pgdat, struct scan_control *sc)
 	unsigned long file;
 	struct lruvec *target_lruvec;
 
-	if (lru_gen_enabled())
+	if (lru_gen_enabled() && !lru_gen_switching())
 		return;
 
 	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
@@ -2957,6 +2958,8 @@ static bool can_age_anon_pages(struct pglist_data *pgdat,
 }
 
 #ifdef CONFIG_LRU_GEN
+
+DEFINE_STATIC_KEY_FALSE(lru_switch);
 
 #ifdef CONFIG_LRU_GEN_ENABLED
 DEFINE_STATIC_KEY_ARRAY_TRUE(lru_gen_caps, NR_LRU_GEN_CAPS);
@@ -3289,7 +3292,9 @@ static bool should_skip_mm(struct mm_struct *mm, struct lru_gen_mm_walk *walk)
 	if (size < MIN_LRU_BATCH)
 		return true;
 
-	return !mmget_not_zero(mm);
+	mmgrab(mm);
+
+	return false;
 }
 
 static bool iterate_mm_list(struct lruvec *lruvec, struct lru_gen_mm_walk *walk,
@@ -3353,7 +3358,7 @@ done:
 		reset_bloom_filter(lruvec, walk->max_seq + 1);
 
 	if (*iter)
-		mmput_async(*iter);
+		mmdrop(*iter);
 
 	*iter = mm;
 
@@ -4114,6 +4119,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
 {
 	int gen, type, zone;
 	bool success = false;
+	bool advanced = false;
 	struct lru_gen_struct *lrugen = &lruvec->lrugen;
 	DEFINE_MIN_SEQ(lruvec);
 
@@ -4130,10 +4136,14 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
 			}
 
 			min_seq[type]++;
+			advanced = true;
 		}
 next:
 		;
 	}
+
+	if (!advanced)
+		return false;
 
 	/* see the comment on lru_gen_struct */
 	if (can_swap) {
@@ -4615,9 +4625,8 @@ static bool sort_page(struct lruvec *lruvec, struct page *page, struct scan_cont
 		return true;
 	}
 
-	/* waiting for writeback */
-	if (PageLocked(page) || PageWriteback(page) ||
-	    (type == LRU_GEN_FILE && PageDirty(page))) {
+	/* waiting for the page lock */
+	if (PageLocked(page)) {
 		gen = page_inc_gen(lruvec, page, true);
 		list_move(&page->lru, &lrugen->lists[gen][type][zone]);
 		return true;
@@ -4655,7 +4664,6 @@ bool isolate_page(struct lruvec *lruvec, struct page *page, struct scan_control 
 		set_mask_bits(&page->flags, LRU_REFS_MASK | LRU_REFS_FLAGS, 0);
 
 	/* for shrink_page_list() */
-	ClearPageReclaim(page);
 	ClearPageReferenced(page);
 
 	success = lru_gen_del_page(lruvec, page, true);
@@ -4666,7 +4674,8 @@ bool isolate_page(struct lruvec *lruvec, struct page *page, struct scan_control 
 EXPORT_SYMBOL_GPL(isolate_page);
 
 static int scan_pages(struct lruvec *lruvec, struct scan_control *sc,
-		      int type, int tier, struct list_head *list)
+		      int type, int tier, int *nr_isolated,
+		      struct list_head *list)
 {
 	int i;
 	int gen;
@@ -4733,6 +4742,7 @@ static int scan_pages(struct lruvec *lruvec, struct scan_control *sc,
 	__count_memcg_events(memcg, item, isolated);
 	__count_memcg_events(memcg, PGREFILL, sorted);
 	__count_vm_events(PGSCAN_ANON + type, isolated);
+	*nr_isolated = isolated;
 
 	/*
 	 * There might not be eligible pages due to reclaim_idx, may_unmap and
@@ -4791,7 +4801,8 @@ static int get_type_to_scan(struct lruvec *lruvec, int swappiness, int *tier_idx
 }
 
 static int isolate_pages(struct lruvec *lruvec, struct scan_control *sc, int swappiness,
-			 int *type_scanned, struct list_head *list)
+			 int *type_scanned, int *nr_isolated,
+			 struct list_head *list)
 {
 	int i;
 	int type;
@@ -4819,7 +4830,8 @@ static int isolate_pages(struct lruvec *lruvec, struct scan_control *sc, int swa
 		if (tier < 0)
 			tier = get_tier_idx(lruvec, type);
 
-		scanned = scan_pages(lruvec, sc, type, tier, list);
+		scanned = scan_pages(lruvec, sc, type, tier, nr_isolated,
+				     list);
 		if (scanned)
 			break;
 
@@ -4837,6 +4849,7 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 {
 	int type;
 	int scanned;
+	int isolated = 0;
 	int reclaimed;
 	LIST_HEAD(list);
 	LIST_HEAD(clean);
@@ -4851,7 +4864,8 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 
 	spin_lock_irq(&lruvec->lru_lock);
 
-	scanned = isolate_pages(lruvec, sc, swappiness, &type, &list);
+	scanned = isolate_pages(lruvec, sc, swappiness, &type, &isolated,
+				&list);
 
 	scanned += try_to_inc_min_seq(lruvec, swappiness);
 
@@ -4865,6 +4879,13 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 retry:
 	reclaimed = shrink_page_list(&list, pgdat, sc, &stat, false);
 	sc->nr_reclaimed += reclaimed;
+
+	/*
+	 * If a complete cold-file batch is dirty and has not been queued for
+	 * writeback, reclaim cannot make progress without a flusher.
+	 */
+	if (stat.nr_unqueued_dirty == isolated)
+		wakeup_flusher_threads(WB_REASON_VMSCAN);
 
 	list_for_each_entry_safe_reverse(page, next, &list, lru) {
 		bool bypass = false;
@@ -4898,7 +4919,6 @@ retry:
 
 		/* retry pages that may have missed rotate_reclaimable_page() */
 		list_move(&page->lru, &clean);
-		sc->nr_scanned -= thp_nr_pages(page);
 	}
 
 	spin_lock_irq(&lruvec->lru_lock);
@@ -5178,6 +5198,8 @@ static void lru_gen_change_state(bool enabled)
 	if (enabled == lru_gen_enabled())
 		goto unlock;
 
+	static_branch_enable_cpuslocked(&lru_switch);
+
 	if (enabled)
 		static_branch_enable_cpuslocked(&lru_gen_caps[LRU_GEN_CORE]);
 	else
@@ -5211,6 +5233,8 @@ static void lru_gen_change_state(bool enabled)
 
 		cond_resched();
 	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
+
+	static_branch_disable_cpuslocked(&lru_switch);
 unlock:
 	mutex_unlock(&state_mutex);
 	put_online_mems();
@@ -5748,9 +5772,11 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	bool proportional_reclaim;
 	struct blk_plug plug;
 
-	if (lru_gen_enabled()) {
+	if (lru_gen_enabled() || lru_gen_switching()) {
 		lru_gen_shrink_lruvec(lruvec, sc);
-		return;
+
+		if (!lru_gen_switching())
+			return;
 	}
 
 	get_scan_count(lruvec, sc, nr);
@@ -6226,7 +6252,7 @@ static void snapshot_refaults(struct mem_cgroup *target_memcg, pg_data_t *pgdat)
 	struct lruvec *target_lruvec;
 	unsigned long refaults;
 
-	if (lru_gen_enabled())
+	if (lru_gen_enabled() && !lru_gen_switching())
 		return;
 
 	target_lruvec = mem_cgroup_lruvec(target_memcg, pgdat);
@@ -6599,9 +6625,11 @@ static void kswapd_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 	struct mem_cgroup *memcg;
 	struct lruvec *lruvec;
 
-	if (lru_gen_enabled()) {
+	if (lru_gen_enabled() || lru_gen_switching()) {
 		lru_gen_age_node(pgdat, sc);
-		return;
+
+		if (!lru_gen_switching())
+			return;
 	}
 
 	if (!can_age_anon_pages(pgdat, sc))
