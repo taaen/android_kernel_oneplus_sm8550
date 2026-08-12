@@ -107,7 +107,7 @@ scm_version()
 		# it fails. Note that git-diff-index does not refresh the
 		# index, so it may give misleading results. See
 		# git-update-index(1), git-diff-index(1), and git-status(1).
-		if {
+		if test "$CONFIG_LOCALVERSION_BPO" != "y" && {
 			git --no-optional-locks status -uno --porcelain 2>/dev/null ||
 			git diff-index --name-only HEAD
 		} | read dummy; then
@@ -170,6 +170,10 @@ elif [ "${LOCALVERSION+set}" != "set" ]; then
 	# If the variable LOCALVERSION is set (including being set
 	# to an empty string), we don't want to append a plus sign.
 	scm=$(scm_version --short)
+fi
+
+if test "$CONFIG_LOCALVERSION_BPO" = "y"; then
+	res="$res-bpo"
 fi
 
 # finally, add the abXXX number if BUILD_NUMBER is set

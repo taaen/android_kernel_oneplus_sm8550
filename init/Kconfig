@@ -201,6 +201,14 @@ config LOCALVERSION_AUTO
 
 	  which is done within the script "scripts/setlocalversion".)
 
+config LOCALVERSION_BPO
+	bool "Append -bpo to identify a backport-enhanced kernel"
+	help
+	  Keep the automatic SCM commit identifier, suppress the dirty tree
+	  marker, and append -bpo to the kernel release. This only changes
+	  the displayed release string; it does not change exported symbol
+	  interfaces or their version CRCs.
+
 config BUILD_SALT
 	string "Build ID Salt"
 	default ""
