@@ -70,14 +70,13 @@ static inline unsigned long compact_gap(unsigned int order)
 	 * try to split an (order - 1) free page. At that point, a gap of
 	 * 1 << order might not be enough, so it's safer to require twice that
 	 * amount. Note that the number of pages on the list is also
-	 * effectively limited by COMPACT_CLUSTER_MAX, as that's the maximum
-	 * that the migrate scanner can have isolated on migrate list, and free
-	 * scanner is only invoked when the number of isolated free pages is
-	 * lower than that. But it's not worth to complicate the formula here
-	 * as a bigger gap for higher orders than strictly necessary can also
-	 * improve chances of compaction success.
+	 * effectively limited by COMPACT_CLUSTER_MAX (32 pages), as that's
+	 * the maximum that the migrate scanner can have isolated on migrate
+	 * list, and free scanner is only invoked when the number of isolated
+	 * free pages is lower than that. Cap the gap at 32 to avoid
+	 * over-reserving for high orders where the scanner cannot use more.
 	 */
-	return 2UL << order;
+	return min(2UL << order, 32UL);
 }
 
 #ifdef CONFIG_COMPACTION

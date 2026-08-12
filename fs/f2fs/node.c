@@ -3127,6 +3127,21 @@ int f2fs_flush_nat_entries(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 						MAX_NAT_JENTRIES(journal));
 	}
 
+	/*
+	 * Readahead NAT blocks that will be written to disk, to prevent
+	 * synchronous one-by-one reads during __flush_nat_entry_set().
+	 */
+	{
+		unsigned int entry_count = 0;
+
+		list_for_each_entry(set, &sets, set_list) {
+			entry_count += set->entry_cnt;
+			if (__has_cursum_space(journal, entry_count, NAT_JOURNAL))
+				continue;
+			f2fs_ra_meta_pages(sbi, set->set, 1, META_NAT, true);
+		}
+	}
+
 	/* flush dirty nats in nat entry set */
 	list_for_each_entry_safe(set, tmp, &sets, set_list) {
 		err = __flush_nat_entry_set(sbi, set, cpc);

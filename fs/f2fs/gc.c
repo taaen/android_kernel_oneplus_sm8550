@@ -826,6 +826,9 @@ retry:
 				if (!f2fs_segment_has_free_slot(sbi, segno))
 					goto next;
 			}
+
+			if (!get_valid_blocks(sbi, segno, true))
+				goto next;
 		}
 
 		if (gc_type == BG_GC && test_bit(secno, dirty_i->victim_secmap))
@@ -956,7 +959,8 @@ static int check_valid_map(struct f2fs_sb_info *sbi,
  * ignore that.
  */
 static int gc_node_segment(struct f2fs_sb_info *sbi,
-		struct f2fs_summary *sum, unsigned int segno, int gc_type)
+		struct f2fs_summary *sum, unsigned int segno, int gc_type,
+		struct blk_plug *plug)
 {
 	struct f2fs_summary *entry;
 	block_t start_addr;
@@ -1025,8 +1029,11 @@ next_step:
 		stat_inc_node_blk_count(sbi, 1, gc_type);
 	}
 
-	if (++phase < 3)
+	if (++phase < 3) {
+		blk_finish_plug(plug);
+		blk_start_plug(plug);
 		goto next_step;
+	}
 
 	if (fggc)
 		atomic_dec(&sbi->wb_sync_req[NODE]);
@@ -1149,7 +1156,7 @@ static int ra_data_block(struct inode *inode, pgoff_t index)
 		.in_list = 0,
 		.retry = 0,
 	};
-	int err;
+	int err = 0;
 
 	page = f2fs_grab_cache_page(mapping, index, true);
 	if (!page)
@@ -1202,6 +1209,9 @@ got_it:
 		err = -ENOMEM;
 		goto put_page;
 	}
+
+	if (PageUptodate(fio.encrypted_page))
+		goto put_encrypted_page;
 
 	err = f2fs_submit_page_bio(&fio);
 	if (err)
@@ -1471,7 +1481,7 @@ out:
  */
 static int gc_data_segment(struct f2fs_sb_info *sbi, struct f2fs_summary *sum,
 		struct gc_inode_list *gc_list, unsigned int segno, int gc_type,
-		bool force_migrate)
+		bool force_migrate, struct blk_plug *plug)
 {
 	struct super_block *sb = sbi->sb;
 	struct f2fs_summary *entry;
@@ -1624,8 +1634,11 @@ next_step:
 		}
 	}
 
-	if (++phase < 5)
+	if (++phase < 5) {
+		blk_finish_plug(plug);
+		blk_start_plug(plug);
 		goto next_step;
+	}
 
 	return submitted;
 }
@@ -1654,8 +1667,7 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 	unsigned int segno = start_segno;
 	unsigned int end_segno = start_segno + sbi->segs_per_sec;
 	int seg_freed = 0, migrated = 0;
-	unsigned char type = IS_DATASEG(get_seg_entry(sbi, segno)->type) ?
-						SUM_TYPE_DATA : SUM_TYPE_NODE;
+	unsigned char type = SUM_TYPE_DATA;
 	int submitted = 0;
 
 	if (__is_large_section(sbi))
@@ -1712,6 +1724,10 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 		if (!PageUptodate(sum_page) || unlikely(f2fs_cp_error(sbi)))
 			goto skip;
 
+		if (migrated == 0)
+			type = IS_DATASEG(get_seg_entry(sbi, segno)->type) ?
+						SUM_TYPE_DATA : SUM_TYPE_NODE;
+
 		sum = page_address(sum_page);
 		if (type != GET_SUM_TYPE((&sum->footer))) {
 			f2fs_err(sbi, "Inconsistent segment (%u) type [%d, %d] in SSA and SIT",
@@ -1731,11 +1747,11 @@ static int do_garbage_collect(struct f2fs_sb_info *sbi,
 		 */
 		if (type == SUM_TYPE_NODE)
 			submitted += gc_node_segment(sbi, sum->entries, segno,
-								gc_type);
+								gc_type, &plug);
 		else
 			submitted += gc_data_segment(sbi, sum->entries, gc_list,
 							segno, gc_type,
-							force_migrate);
+							force_migrate, &plug);
 
 		stat_inc_seg_count(sbi, type, gc_type);
 		sbi->gc_reclaimed_segs[sbi->gc_mode]++;
